@@ -154,6 +154,349 @@ Charging a lead-acid battery involves three distinct phases:
 ![3D](4.png)
 
 ## Arduino Code
+- Include libraries
+```c
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+```
+
+- OLED display width and height
+```c
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+```
+
+- Declaration for an SSD1306 display connected using I2C
+```c
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+```
+
+- Battery Constants
+```c
+#define bulk_voltage_max 14.5
+#define bulk_voltage_min 13
+#define absorption_voltage 14.7
+#define float_voltage_max 13
+#define battery_min_voltage 10
+#define solar_min_voltage 19
+#define charging_current 2.0
+#define absorption_max_current 2.0
+#define absorption_min_current 0.1
+#define float_voltage_min 13.2
+#define float_voltage 13.4
+#define float_max_current 0.12
+#define OLED_refresh_rate 1000
+byte BULK = 0;        // Give values to each mode
+byte ABSORPTION = 1;
+byte FLOAT = 2;
+byte mode = 0;        // Start with mode 0 BULK
+```
+
+- Inputs
+```c
+#define solar_voltage_in A7
+#define solar_current_in A1
+#define battery_voltage_in A0
+#define Soil1 A2
+#define Soil2 A3
+#define Soil3 A6
+```
+
+- Outputs
+```c
+#define PWM_out 3
+#define load_enable 2 //VCTRL
+#define Pump1 4
+#define Pump2 5
+#define Pump3 6
+```
+
+- Variables
+```c
+// Define moisture threshold
+#define MOISTURE_THRESHOLD 250
+
+// Variables
+float bat_voltage = 0;
+int pwm_value = 0;
+float solar_current = 0;
+float current_factor = 0.185;       // Value defined by manufacturer ACS712 5A
+float solar_voltage = 0;
+float solar_power = 0;
+String load_status = "OFF";
+int pwm_percentage = 0;
+unsigned int before_millis = 0;
+unsigned int now_millis = 0;
+String mode_str = "BULK";
+```
+
+- Setup
+```c
+void setup() {
+  pinMode(solar_voltage_in, INPUT);    // Set pins as inputs
+  pinMode(solar_current_in, INPUT);
+  pinMode(battery_voltage_in, INPUT);
+
+  pinMode(PWM_out, OUTPUT);            // Set pins as outputs
+  digitalWrite(PWM_out, LOW);          // Set PWM to LOW so MOSFET is off
+  pinMode(load_enable, OUTPUT);
+  digitalWrite(load_enable, LOW);      // Start with the relay turned off
+  pinMode(Soil1, INPUT);
+  pinMode(Soil2, INPUT);
+  pinMode(Soil3, INPUT);
+  pinMode(Pump1, OUTPUT);
+  pinMode(Pump2, OUTPUT);
+  pinMode(Pump3, OUTPUT);
+  digitalWrite(Pump1, LOW);
+  digitalWrite(Pump2, LOW);
+  digitalWrite(Pump3, LOW);
+
+
+  TCCR1B = TCCR1B & B11111000 | B00000001; // Timer 1 PWM frequency of 31372.55 Hz
+  Serial.begin(9600);
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_I2C_ADDRESS, 0x3C)) { // Address 0x3C for most OLEDs
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+  before_millis = millis;     // Used for OLED refresh rate
+}
+```
+
+- Loop
+```c
+void loop() {
+  solar_voltage = get_solar_voltage(15);
+  bat_voltage = get_battery_voltage(15);
+  solar_current = get_solar_current(15);
+  solar_power = bat_voltage * solar_current;
+  pwm_percentage = map(pwm_value, 0, 255, 0, 100);
+
+  now_millis = millis();
+  if (now_millis - before_millis > OLED_refresh_rate) {
+    before_millis = now_millis;
+
+    // Clear the OLED display
+    display.clearDisplay();
+
+    // Display solar and battery voltages
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Solar: ");
+    display.print(solar_voltage, 2);
+    display.print("V  Battery: ");
+    display.print(bat_voltage, 2);
+    display.println("V");
+
+    // Display solar current and load status
+    display.setCursor(0, 10);
+    display.print("Current: ");
+    display.print(solar_current, 2);
+    display.print("A  Load: ");
+    display.print(load_status);
+
+    // Display solar power and PWM percentage
+    display.setCursor(0, 20);
+    display.print("Power: ");
+    display.print(solar_power, 2);
+    display.print("W  PWM: ");
+    display.print(pwm_percentage);
+    display.println("%");
+
+    // Display the current mode
+    display.setCursor(0, 30);
+    display.print("Mode: ");
+    display.print(mode_str);
+
+    // Update the OLED display
+    display.display();
+  }
+
+  if (bat_voltage < battery_min_voltage) {
+    digitalWrite(load_enable, LOW);        // Disable the load if battery is undervoltage
+    load_status = "OFF";
+  } else {
+    digitalWrite(load_enable, HIGH);       // Enable the load if battery charged
+    load_status = "ON";
+  }
+
+  // Manage modes and PWM adjustment
+  if (mode == FLOAT) {
+    if (bat_voltage < float_voltage_min) {
+      mode = BULK;
+      mode_str = "BULK";
+    } else {
+      if (solar_current > float_max_current) {
+        mode = BULK;
+        mode_str = "BULK";
+      } else {
+        if (bat_voltage > float_voltage) {
+          pwm_value--;
+          pwm_value = constrain(pwm_value, 0, 254);
+        } else {
+          pwm_value++;
+          pwm_value = constrain(pwm_value, 0, 254);
+        }
+      }
+      analogWrite(PWM_out, pwm_value);
+    }
+  } else {
+    if (bat_voltage < bulk_voltage_min) {
+      mode = BULK;
+      mode_str = "BULK";
+    } else if (bat_voltage > bulk_voltage_max) {
+      mode_str = "ABSORPTION";
+      mode = ABSORPTION;
+    }
+
+    if (mode == BULK) {
+      if (solar_current > charging_current) {
+        pwm_value--;
+        pwm_value = constrain(pwm_value, 0, 254);
+      } else {
+        pwm_value++;
+        pwm_value = constrain(pwm_value, 0, 254);
+      }
+      analogWrite(PWM_out, pwm_value);
+    }
+
+    if (mode == ABSORPTION) {
+      if (solar_current > absorption_max_current) {
+        pwm_value--;
+        pwm_value = constrain(pwm_value, 0, 254);
+      } else {
+        if (bat_voltage > absorption_voltage) {
+          pwm_value++;
+          pwm_value = constrain(pwm_value, 0, 254);
+        } else {
+          pwm_value--;
+          pwm_value = constrain(pwm_value, 0, 254);
+        }
+        if (solar_current < absorption_min_current) {
+          mode = FLOAT;
+          mode_str = "FLOAT";
+        }
+      }
+      analogWrite(PWM_out, pwm_value);
+    }
+  }
+  checkSoilMoisture(SOIL_SENSOR_1, PUMP_1);
+  checkSoilMoisture(SOIL_SENSOR_2, PUMP_2);
+  checkSoilMoisture(SOIL_SENSOR_3, PUMP_3);
+
+  // Debugging: print soil moisture levels
+  Serial.print("Sensor 1: ");
+  Serial.println(analogRead(SOIL_SENSOR_1));
+  Serial.print("Sensor 2: ");
+  Serial.println(analogRead(SOIL_SENSOR_2));
+  Serial.print("Sensor 3: ");
+  Serial.println(analogRead(SOIL_SENSOR_3));
+
+  delay(1000); // Wait for 1 second before the next reading
+}
+```
+
+- Get solar voltage function
+```c
+float get_solar_voltage(int n_samples) {
+  const float V_REF = 5.0; // Reference voltage of the Arduino ADC
+  const int ADC_RESOLUTION = 1023; // 10-bit ADC resolution
+  const float DIVIDER_SCALING = 0.421; // Scaling factor for the voltage divider
+  
+  float voltage = 0;
+  
+  for (int i = 0; i < n_samples; i++) {
+    // Read raw ADC value and convert to input pin voltage
+    float adc_voltage = analogRead(solar_voltage_in) * (V_REF / ADC_RESOLUTION);
+    // Scale up to the actual solar panel voltage
+    voltage += adc_voltage / DIVIDER_SCALING;
+  }
+
+  // Average the sampled voltage
+  voltage = voltage / n_samples;
+
+  // Ensure no negative voltage (shouldn't happen with solar panels)
+  if (voltage < 0) {
+    voltage = 0;
+  }
+
+  return voltage;
+}
+```
+
+- Get Battery Voltage function
+```c
+float get_battery_voltage(int n_samples) {
+  const float V_REF = 5.0; // Reference voltage of the ADC
+  const int ADC_RESOLUTION = 1023; // 10-bit ADC resolution
+  const float DIVIDER_SCALING = 0.421; // Voltage divider scaling factor
+  
+  float voltage = 0;
+
+  // Enable load
+  digitalWrite(load_enable, HIGH);
+  
+  // Read and accumulate voltage samples
+  for (int i = 0; i < n_samples; i++) {
+    float adc_voltage = analogRead(battery_voltage_in) * (V_REF / ADC_RESOLUTION);
+    voltage += adc_voltage / DIVIDER_SCALING;
+  }
+
+  // Average the voltage samples
+  voltage = voltage / n_samples;
+
+  // Ensure no negative voltage (shouldn't happen with a battery)
+  if (voltage < 0) {
+    voltage = 0;
+  }
+
+  return voltage;
+}
+```
+
+- get solar current
+```c
+float get_solar_current(int n_samples) {
+  float Sensor_voltage;
+  float current = 0;
+  float offset_voltage = 2.5; // Adjust this value if needed (e.g., for zero current)
+  for (int i = 0; i < n_samples; i++) {
+    // Read the voltage from the A7 pin and scale it to the 0-5V range
+    Sensor_voltage = analogRead(A7) * (5.0 / 1023.0);
+    
+    // Subtract the offset voltage (e.g., 2.5V is a baseline for zero current)
+    current += (Sensor_voltage - offset_voltage) / current_factor;
+  }
+  
+  // Calculate the average current
+  current = current / n_samples;
+  
+  // Ensure that current is non-negative
+  if (current < 0) { current = 0; }
+  
+  return current;
+}
+```
+
+- Check Moisture Function
+```c
+void checkSoilMoisture(int sensorPin, int pumpPin) {
+  int moistureLevel = analogRead(sensorPin); // Read the soil moisture sensor value
+
+  if (moistureLevel < MOISTURE_THRESHOLD) {
+    // Soil needs water, turn on the pump
+    digitalWrite(pumpPin, HIGH);
+  } else {
+    // Soil is sufficiently moist, turn off the pump
+    digitalWrite(pumpPin, LOW);
+  }
+}
+```
 
 ## Advantages of the Automated Plant Monitoring System with MPPT Controller
 1. Efficient Energy Utilization: The MPPT (Maximum Power Point Tracking) controller ensures that the solar panel operates at its maximum power point, maximizing the energy harvested and minimizing waste.
